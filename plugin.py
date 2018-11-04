@@ -13,10 +13,13 @@ Requires:
         and depending on your python version and system you might need to make a symlink such as for example:
         sudo ln -s /usr/local/lib/python3.5/dist-packages/bluepy /usr/lib/python3.5/
 
-Version:    2018.11.02 (beta)
+Versions:   2018.11.02 (beta) - first release
+            2018.11.04 (beta) - battery level can be tracked with a dedicated device showing up in the GUI:
+                                this is derived from my BatteryLevel plugin (https://github.com/999LV/BatteryLevel).
+                                Also some minor edits
 """
 """
-<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2018.11.02" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
+<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2018.11.04" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
     <description>
 MiPow PlayBulb plugin<br/><br/>
 Control MiPow PlayBulb Bluetooth LE LED lamps<br/>
@@ -34,11 +37,17 @@ sudo ln -s /usr/local/lib/python3.5/dist-packages/bluepy /usr/lib/python3.5/<br/
             </options>
         </param>
         <param field="Address" label="Lamp Bluetooth MAC address" width="200px" required="true" default="FF:FF:FF:FF"/>
-        <param field="Mode1" label="Battery poll" width="150px">
+        <param field="Mode1" label="Battery poll" width="100px">
             <options>
                 <option label="1 hour" value="1"/>
                 <option label="6 hours" value="6" default="true"/>
                 <option label="24 hours" value="24"/>
+            </options>
+        </param>
+        <param field="Mode2" label="Battery level device" width="50px">
+            <options>
+                <option label="Yes" value="1"/>
+                <option label="No" value="0" default="true"/>
             </options>
         </param>
         <param field="Mode6" label="Debug" width="150px">
@@ -62,6 +71,10 @@ from datetime import datetime, timedelta
 import time
 import MiPowPlayBulbAPI as API
 
+icons = {"mipowplaybulbfull": "mipowplaybulbfull icons.zip",
+         "mipowplaybulbok": "mipowplaybulbok icons.zip",
+         "mipowplaybulblow": "mipowplaybulblow icons.zip",
+         "mipowplaybulbempty": "mipowplaybulbempty icons.zip"}
 
 class BasePlugin:
 
@@ -76,14 +89,20 @@ class BasePlugin:
         self.speed = 1 # fastest effects speed
         self.battery = 255
         self.nextpoll = datetime.now()  # battery polling heartbeat counter
-        self.nextbeat = datetime.now()  # reconnect heartbear counter
-        self.started = False
-        self.initdone = False
 
 
     def onStart(self):
 
         Domoticz.Debugging(int(Parameters["Mode6"]))
+
+        # load custom battery images
+        for key, value in icons.items():
+            if key not in Images:
+                Domoticz.Status("Icon with key '{}' does not exist... Creating".format(key))
+                Domoticz.Image(value).Create()
+            else:
+                Domoticz.Debug("Icon {} - {} with key '{}' already exists".format(
+                    Images[key].ID, Images[key].Name, key))
 
         # set up the devices for the plugin
         if 1 not in Devices:
@@ -122,6 +141,13 @@ class BasePlugin:
         if self.lamp.connected:
             self.lamp.timeout = 2  # connect went well, so we can afford a shorter timeout (to be tested)
             self._ResetLamp()
+
+        if Parameters["Mode2"] == "1":
+            if 4 not in Devices:
+                Domoticz.Device(Name="Battery", Unit=4, TypeName="Custom", Options={"Custom": "1;%"}).Create()
+            else:
+                # should we delete existing device if it is no longer wanted ?
+                pass  # for now
 
 
     def onStop(self):
@@ -207,6 +233,20 @@ class BasePlugin:
             if self.lamp.get_state():
                 self.battery = int(self.lamp.battery)
                 self._updateDevice(1, BatteryLevel=self.battery)
+                # we update the battery level device if the user wants to see it
+                if Parameters["Mode2"] == "1" and not self.battery == 255:
+                    if self.battery >= 75:
+                        icon = "mipowplaybulbfull"
+                    elif self.battery >= 50:
+                        icon = "mipowplaybulbok"
+                    elif self.battery >= 25:
+                        icon = "mipowplaybulblow"
+                    else:
+                        icon = "mipowplaybulbempty"
+                    try:
+                        self._updateDevice(4, nValue=0, sValue=str(self.battery), Image=Images[icon].ID)
+                    except Exception as error:
+                        Domoticz.Error("Failed to update battery level device due to: {}".format(error))
 
 
     @staticmethod
@@ -251,6 +291,10 @@ class BasePlugin:
                         if change:
                             update_args[arg] = kwargs[arg]
                     Domoticz.Debug("Color = {}".format(kwargs[arg]))
+                if arg == "Image":
+                        if kwargs[arg] != Devices[Unit].Image:
+                            change = True
+                            update_args[arg] = kwargs[arg]
             Domoticz.Debug("Change in device {} = {}".format(Unit, change))
             if change:
                 Devices[Unit].Update(**update_args)

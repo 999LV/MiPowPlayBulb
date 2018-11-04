@@ -81,7 +81,6 @@ class MiPowLamp:
         self.name = None
         self.battery = 255
         self.power = False
-        self.handlename = None
         self.handlebattery = None
         self.handleWRGB = None
         self.handleWRGBES = None
@@ -108,13 +107,10 @@ class MiPowLamp:
                     hook = characteristic.uuid.getCommonName()
                     handle = characteristic.getHandle()
                     if hook == "Manufacturer Name String":
-                        self.handlename = handle
                         self.manufacturer = self.device.readCharacteristic(handle).decode('utf-8')
                     if hook == "Serial Number String":
-                        self.handlename = handle
                         self.serial = self.device.readCharacteristic(handle).decode('utf-8')
                     if hook == "Device Name":
-                        self.handlename = handle
                         self.name = self.device.readCharacteristic(handle).decode('utf-8')
                     elif hook == "Battery Level":
                         self.handlebattery = handle
@@ -128,8 +124,8 @@ class MiPowLamp:
                 else:
                     logging.info("Connected to device: Name = '{}', Manufacturer = '{}', Serial = '{}'".format(
                         self.name, self.manufacturer, self.serial))
-                    logging.debug("Bluetooth Color Handle = {}".format(hex(self.handleWRGB)))
-                    logging.debug("Bluetooth Effects Handle = {}".format(hex(self.handleWRGBES)))
+                    logging.info("Bluetooth Color Handle = {}".format(hex(self.handleWRGB)))
+                    logging.info("Bluetooth Effects Handle = {}".format(hex(self.handleWRGBES)))
                     self.get_state()
                 return True
             except btle.BTLEException as error:

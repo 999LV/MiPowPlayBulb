@@ -13,7 +13,8 @@ Also credits to Heckie75 (https://github.com/Heckie75/Mipow-Playbulb-BTL201)
 This code is released under the terms of the MIT license. See the LICENSE
 file for more details.
 
-Version:    2018.7.15 (beta)
+Version:    2018.11.24 (beta)
+            2018.12.04 fix the reconnect process if the device is not connected
 
 """
 
@@ -47,15 +48,17 @@ _MANUFACTURER = "Mipow Limited"
 
 # below are types of PlayBulb that "should" work with this code... requires user feedback to confirm
 # source of info is https://github.com/Heckie75/Mipow-Playbulb-BTL201
-_SERIAL = ("BTL300",    # PlayBulb Candle - tested
-           "BTL200",    # PlayBulb Rainbow - untested
-           "BTL201",    # Playbulb Smart - untested
-           "BTL203",    # Playbulb Spot Mesh - untested
-           "BTL301W",   # Playbulb Sphere - untested
-           "BTL400",    # Playbulb Garden - untested
-           "BTL501A",   # Playbulb Comet - untested
-           "BTL505-GN", # Playbulb String - untested
-           "BTL601")    # Playbulb Solar - untested
+_SERIAL = (
+    "BTL300",        # PlayBulb Candle - tested
+    "STRING MESH",  # Playbulb String Mesh - tested by Github user DJFliX
+    "BTL200",        # PlayBulb Rainbow - untested
+    "BTL201",        # Playbulb Smart - untested
+    "BTL203",        # Playbulb Spot Mesh - untested
+    "BTL301W",       # Playbulb Sphere - untested
+    "BTL400",        # Playbulb Garden - untested
+    "BTL501A",       # Playbulb Comet - untested
+    "BTL505-GN",     # Playbulb String - untested
+    "BTL601")        # Playbulb Solar - untested
 
 class Delegate(btle.DefaultDelegate):
     """Delegate Class."""
@@ -92,6 +95,7 @@ class MiPowLamp:
         self.effect = 0
         self.speed = 0
         self.errmsg = ""
+        self.strict_check = True
 
 
     def connect(self):
@@ -118,7 +122,7 @@ class MiPowLamp:
                         self.handleWRGB = handle
                     elif hook == "fffb":
                         self.handleWRGBES = handle
-                if self.manufacturer != _MANUFACTURER and not self.serial in _SERIAL:
+                if self.manufacturer != _MANUFACTURER or (self.strict_check and not self.serial in _SERIAL):
                     logging.error("Device found is not supported: Manufacturer = '{}', Serial = '{}' !".format(
                         self.name, self.manufacturer, self.serial))
                 else:
@@ -143,16 +147,19 @@ class MiPowLamp:
 
 
     def _send_packet(self, handleId, data):
-        self.errmsg = ""
         if not self.connected:
-            self.connect()
+            self.connected = self.connect()
         if self.connected:
+            self.errmsg = ""
             try:
                 self.device.writeCharacteristic(handleId, data)
                 return True
             except btle.BTLEException as error:
+                self.connected = False
                 self.errmsg = "MiPowPlayBulbAPI packet send error: {}".format(error)
                 logging.error(self.errmsg)
+        else:
+            self.errmsg = "MiPowPlayBulbAPI : device not connected, could not send packet"
         return False
 
 
@@ -208,10 +215,10 @@ class MiPowLamp:
 
 
     def get_state(self):
-        errmsg = None
         if not self.connected:
-            self.connect()
+            self.connected = self.connect()
         if self.connected:
+            self.errmsg = ""
             try:
                 status = self.device.readCharacteristic(self.handleWRGB)
                 if bytearray(status) != bytearray([0, 0, 0, 0]):
@@ -231,6 +238,9 @@ class MiPowLamp:
                 self.battery = int.from_bytes(self.device.readCharacteristic(self.handlebattery), byteorder='big')
                 return True
             except btle.BTLEException as error:
-                errmsg = "MiPowPlayBulbAPI status read error: {}".format(error)
-                logging.error(errmsg)
+                self.connected = False
+                self.errmsg = "MiPowPlayBulbAPI status read error: {}".format(error)
+                logging.error(self.errmsg)
+        else:
+            self.errmsg = "MiPowPlayBulbAPI : device not connected, could not read status"
         return False

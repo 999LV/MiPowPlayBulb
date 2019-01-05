@@ -17,9 +17,13 @@ Versions:   2018.11.02 (beta) - first release
             2018.11.04 (beta) - battery level can be tracked with a dedicated device showing up in the GUI:
                                 this is derived from my BatteryLevel plugin (https://github.com/999LV/BatteryLevel).
                                 Also some minor edits
+            2018.11.24 (beta) - change timing of battery poll when lamp is on (faster discharge = more frequent polls)
+            2018.12.15 (beta) - reload battery level when the device is reconnected after a disconnect
+            2019.01.05 (beta) - change order of switching parameters in _ResetLamp function to correct lamps always
+                                switching on when plugin (re)starts
 """
 """
-<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2018.11.04" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
+<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2019.01.05" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
     <description>
 MiPow PlayBulb plugin<br/><br/>
 Control MiPow PlayBulb Bluetooth LE LED lamps<br/>
@@ -40,14 +44,20 @@ sudo ln -s /usr/local/lib/python3.5/dist-packages/bluepy /usr/lib/python3.5/<br/
         <param field="Mode1" label="Battery poll" width="100px">
             <options>
                 <option label="1 hour" value="1"/>
-                <option label="6 hours" value="6" default="true"/>
-                <option label="24 hours" value="24"/>
+                <option label="6 hours" value="6"/>
+                <option label="24 hours" value="24" default="true"/>
             </options>
         </param>
         <param field="Mode2" label="Battery level device" width="50px">
             <options>
                 <option label="Yes" value="1"/>
                 <option label="No" value="0" default="true"/>
+            </options>
+        </param>
+        <param field="Mode3" label="Strict Device Type Check" width="50px">
+            <options>
+                <option label="Yes" value="1" default="true"/>
+                <option label="No" value="0"/>
             </options>
         </param>
         <param field="Mode6" label="Debug" width="150px">
@@ -71,10 +81,12 @@ from datetime import datetime, timedelta
 import time
 import MiPowPlayBulbAPI as API
 
-icons = {"mipowplaybulbfull": "mipowplaybulbfull icons.zip",
+_icons = {"mipowplaybulbfull": "mipowplaybulbfull icons.zip",
          "mipowplaybulbok": "mipowplaybulbok icons.zip",
          "mipowplaybulblow": "mipowplaybulblow icons.zip",
          "mipowplaybulbempty": "mipowplaybulbempty icons.zip"}
+
+_battery_check_timer_when_on = 30  # minutes
 
 class BasePlugin:
 
@@ -89,6 +101,8 @@ class BasePlugin:
         self.speed = 1 # fastest effects speed
         self.battery = 255
         self.nextpoll = datetime.now()  # battery polling heartbeat counter
+        self.lastpoll = self.nextpoll  # baseline used when heartbeat poll changes as lamp is on or off
+
 
 
     def onStart(self):
@@ -96,7 +110,7 @@ class BasePlugin:
         Domoticz.Debugging(int(Parameters["Mode6"]))
 
         # load custom battery images
-        for key, value in icons.items():
+        for key, value in _icons.items():
             if key not in Images:
                 Domoticz.Status("Icon with key '{}' does not exist... Creating".format(key))
                 Domoticz.Image(value).Create()
@@ -138,6 +152,7 @@ class BasePlugin:
         if self.lamp:
             self.lamp.timeout = 5  # we set 5 seconds for first discovery of the bluetooth device
             self.lamp.connect()
+            self.lamp.strict_check = True if Parameters["Mode3"] == "1" else False
         if self.lamp.connected:
             self.lamp.timeout = 2  # connect went well, so we can afford a shorter timeout (to be tested)
             self._ResetLamp()
@@ -163,6 +178,7 @@ class BasePlugin:
 
         if Unit == 1:  # Main switch
             if Command == "On":
+                self.nextpoll = self.lastpoll + timedelta(minutes=_battery_check_timer_when_on)
                 if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
                     self._updateDevice(Unit, nValue=1, TimedOut=0)
                     # resend effect and speed as these are lost when lamp is switched off
@@ -173,6 +189,7 @@ class BasePlugin:
                     self._updateDevice(Unit, TimedOut=1)
 
             elif Command == "Off":
+                self.nextpoll = self.lastpoll + timedelta(hours=int(Parameters["Mode1"]))
                 if self.lamp.off():
                     self._updateDevice(Unit, nValue=0, TimedOut=0)
                 else:
@@ -227,8 +244,17 @@ class BasePlugin:
     def onHeartbeat(self):
 
         now = datetime.now()
+
+        if self.lamp.reconnected:  # if the device just reconnected, force an immediate reload of battery level
+            self.lamp.reconnected = False
+            self.nextpoll = now
+
         if self.nextpoll <= now:
-            self.nextpoll = now + timedelta(hours=int(Parameters["Mode1"]))
+            self.lastpoll = now
+            if Devices[1].nValue == 1:
+                self.nextpoll = now + timedelta(minutes=_battery_check_timer_when_on)
+            else:
+                self.nextpoll = now + timedelta(hours=int(Parameters["Mode1"]))
             Domoticz.Debug("next poll will be{}".format(self.nextpoll))
             if self.lamp.get_state():
                 self.battery = int(self.lamp.battery)
@@ -302,16 +328,17 @@ class BasePlugin:
 
     def _ResetLamp(self):
         # switch what needs to be switched
-        if Devices[1].nValue == 1:  # lamp should be on
-            self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite)
-        else:
-            self.lamp.off()
 
         # update effects
         self.lamp.set_effect(self.effect)
 
         # update speed
         self.lamp.set_speed(self.speed)
+
+        if Devices[1].nValue == 1:  # lamp should be on
+            self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite)
+        else:
+            self.lamp.off()
 
         # get battery level
         self.lamp.get_state()

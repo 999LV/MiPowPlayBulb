@@ -21,9 +21,10 @@ Versions:   2018.11.02 (beta) - first release
             2018.12.15 (beta) - reload battery level when the device is reconnected after a disconnect
             2019.01.05 (beta) - change order of switching parameters in _ResetLamp function to correct lamps always
                                 switching on when plugin (re)starts
+            2019.02.09 (beta) - improve handling of battery level
 """
 """
-<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2019.01.05" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
+<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2019.02.09" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
     <description>
 MiPow PlayBulb plugin<br/><br/>
 Control MiPow PlayBulb Bluetooth LE LED lamps<br/>
@@ -160,9 +161,9 @@ class BasePlugin:
         if Parameters["Mode2"] == "1":
             if 4 not in Devices:
                 Domoticz.Device(Name="Battery", Unit=4, TypeName="Custom", Options={"Custom": "1;%"}).Create()
-            else:
-                # should we delete existing device if it is no longer wanted ?
-                pass  # for now
+        else:
+            if 4 in Devices:  # delete existing device as it is no longer wanted
+                Devices[4].Delete()
 
 
     def onStop(self):
@@ -258,7 +259,7 @@ class BasePlugin:
             Domoticz.Debug("next poll will be{}".format(self.nextpoll))
             if self.lamp.get_state():
                 self.battery = int(self.lamp.battery)
-                self._updateDevice(1, BatteryLevel=self.battery)
+                self._updateDevice(1, BatteryLevel=self.battery, Forced=True, TimedOut=0)
                 # we update the battery level device if the user wants to see it
                 if Parameters["Mode2"] == "1" and not self.battery == 255:
                     if self.battery >= 75:
@@ -270,10 +271,13 @@ class BasePlugin:
                     else:
                         icon = "mipowplaybulbempty"
                     try:
-                        self._updateDevice(4, nValue=0, sValue=str(self.battery), Image=Images[icon].ID)
+                        self._updateDevice(4, nValue=0, sValue=str(self.battery), Image=Images[icon].ID, TimedOut=0)
                     except Exception as error:
                         Domoticz.Error("Failed to update battery level device due to: {}".format(error))
-
+            else:
+                self._updateDevice(1, TimedOut=1)
+                if 4 in Devices:
+                    self._updateDevice(4, TimedOut=1)
 
     @staticmethod
     def _updateDevice(Unit, **kwargs):
@@ -321,6 +325,8 @@ class BasePlugin:
                         if kwargs[arg] != Devices[Unit].Image:
                             change = True
                             update_args[arg] = kwargs[arg]
+                if arg == "Forced":
+                    change = change or kwargs[arg]
             Domoticz.Debug("Change in device {} = {}".format(Unit, change))
             if change:
                 Devices[Unit].Update(**update_args)

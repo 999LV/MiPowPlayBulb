@@ -22,9 +22,10 @@ Versions:   2018.11.02 (beta) - first release
             2019.01.05 (beta) - change order of switching parameters in _ResetLamp function to correct lamps always
                                 switching on when plugin (re)starts
             2019.02.09 (beta) - improve handling of battery level
+            2019.03.21 - Implement multi-threading to call on the hardware, to avoid locking the plugins thread.
 """
 """
-<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2019.02.09" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
+<plugin key="MiPowPlayBulb" name="MiPow PlayBulb Python Plugin" author="logread" version="2019.03.21" wikilink="https://www.domoticz.com/wiki/Plugins.html" externallink="https://github.com/999LV/MiPowPlayBulb">
     <description>
 MiPow PlayBulb plugin<br/><br/>
 Control MiPow PlayBulb Bluetooth LE LED lamps<br/>
@@ -66,7 +67,7 @@ sudo ln -s /usr/local/lib/python3.5/dist-packages/bluepy /usr/lib/python3.5/<br/
                 <option label="None" value="0"  default="true" />
                 <option label="Python Only" value="2"/>
                 <option label="Basic Debugging" value="62"/>
-                <option label="Basic+Messages" value="126"/>
+                <option label="Basic+tasks" value="126"/>
                 <option label="Connections Only" value="16"/>
                 <option label="Connections+Python" value="18"/>
                 <option label="Connections+Queue" value="144"/>
@@ -81,16 +82,18 @@ import json
 from datetime import datetime, timedelta
 import time
 import MiPowPlayBulbAPI as API
+import threading
+import queue
 
 _icons = {"mipowplaybulbfull": "mipowplaybulbfull icons.zip",
-         "mipowplaybulbok": "mipowplaybulbok icons.zip",
-         "mipowplaybulblow": "mipowplaybulblow icons.zip",
-         "mipowplaybulbempty": "mipowplaybulbempty icons.zip"}
+          "mipowplaybulbok": "mipowplaybulbok icons.zip",
+          "mipowplaybulblow": "mipowplaybulblow icons.zip",
+          "mipowplaybulbempty": "mipowplaybulbempty icons.zip"}
 
 _battery_check_timer_when_on = 30  # minutes
 
-class BasePlugin:
 
+class BasePlugin:
 
     def __init__(self):
         self.lamp = None
@@ -99,16 +102,17 @@ class BasePlugin:
         self.levelGreen = 0
         self.levelBlue = 0
         self.effect = 255  # effects are Off)
-        self.speed = 1 # fastest effects speed
+        self.speed = 1     # fastest effects speed
         self.battery = 255
         self.nextpoll = datetime.now()  # battery polling heartbeat counter
-        self.lastpoll = self.nextpoll  # baseline used when heartbeat poll changes as lamp is on or off
-
-
+        self.lastpoll = self.nextpoll   # baseline used when heartbeat poll changes as lamp is on or off
+        self.tasksQueue = queue.Queue()
+        self.tasksThread = threading.Thread(name="QueueThread", target=BasePlugin.handleTasks, args=(self,))
 
     def onStart(self):
 
         Domoticz.Debugging(int(Parameters["Mode6"]))
+        self.tasksThread.start()
 
         # load custom battery images
         for key, value in _icons.items():
@@ -150,13 +154,7 @@ class BasePlugin:
             self.speed = max(int((100 - Devices[3].LastLevel) / 100 * 255), 1)  # speed 1 = Fastest, speed 255 = Slowest
 
         self.lamp = API.MiPowLamp(int(Parameters["Port"]), Parameters["Address"], int(Parameters["Mode6"]))
-        if self.lamp:
-            self.lamp.timeout = 5  # we set 5 seconds for first discovery of the bluetooth device
-            self.lamp.connect()
-            self.lamp.strict_check = True if Parameters["Mode3"] == "1" else False
-        if self.lamp.connected:
-            self.lamp.timeout = 2  # connect went well, so we can afford a shorter timeout (to be tested)
-            self._ResetLamp()
+        self.tasksQueue.put({"Action": "Init"})
 
         if Parameters["Mode2"] == "1":
             if 4 not in Devices:
@@ -165,12 +163,23 @@ class BasePlugin:
             if 4 in Devices:  # delete existing device as it is no longer wanted
                 Devices[4].Delete()
 
-
     def onStop(self):
 
         Domoticz.Log("onStop - Plugin is stopping.")
-        self.lamp.disconnect()
 
+        # signal queue thread to exit
+        self.tasksQueue.put(None)
+        Domoticz.Status("Clearing tasks queue...")
+        self.tasksQueue.join()
+
+        # Wait until queue thread has exited
+        Domoticz.Status("Threads still active: " + str(threading.active_count()) + ", should be 1.")
+        while threading.active_count() > 1:
+            for thread in threading.enumerate():
+                if thread.name != threading.current_thread().name:
+                    Domoticz.Status(
+                        "'" + thread.name + "' is still running, waiting otherwise Domoticz will abort on plugin exit.")
+            time.sleep(1.0)
 
     def onCommand(self, Unit, Command, Level, Color):
 
@@ -180,67 +189,28 @@ class BasePlugin:
         if Unit == 1:  # Main switch
             if Command == "On":
                 self.nextpoll = self.lastpoll + timedelta(minutes=_battery_check_timer_when_on)
-                if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
-                    self._updateDevice(Unit, nValue=1, TimedOut=0)
-                    # resend effect and speed as these are lost when lamp is switched off
-                    time.sleep(1)
-                    self.lamp.set_effect(self.effect)
-                    self.lamp.set_speed(self.speed)
-                else:
-                    self._updateDevice(Unit, TimedOut=1)
+                self.tasksQueue.put({"Action": "On"})
 
             elif Command == "Off":
                 self.nextpoll = self.lastpoll + timedelta(hours=int(Parameters["Mode1"]))
-                if self.lamp.off():
-                    self._updateDevice(Unit, nValue=0, TimedOut=0)
-                else:
-                    self._updateDevice(Unit, TimedOut=1)
+                self.tasksQueue.put({"Action": "Off"})
 
             elif Command == "Set Color":
-                ColorDict = json.loads(Color)
-                Domoticz.Debug("Color dictionnary = {}, LastLevel = {}".format(Devices[1].Color, Devices[1].LastLevel))
-                if ColorDict["m"] == 1 or ColorDict["m"] == 3:
-                    self.levelRed = int(ColorDict["r"] * Level / 100)
-                    self.levelGreen = int(ColorDict["g"] * Level / 100)
-                    self.levelBlue = int(ColorDict["b"] * Level / 100)
-                    self.levelWhite = int(ColorDict["ww"] * Level / 100)
-                    if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
-                        self._updateDevice(Unit, nValue=1, sValue=str(Level), Color=Color, TimedOut=0)
-                    else:
-                        self._updateDevice(Unit, TimedOut=1)
-                else:
-                    Domoticz.Error("Invalid 'Set Color' m-value: {}".format(ColorDict["m"]))
+                self.tasksQueue.put({"Action": "SetColor", "Color": Color, "Level": Level})
 
             elif Command == "Set Level":
-                LastLevel = 100 if Devices[1].LastLevel == 0 else Devices[1].LastLevel
-                self.levelRed = int(self.levelRed / LastLevel * Level)
-                self.levelGreen = int(self.levelGreen / LastLevel * Level)
-                self.levelBlue = int(self.levelBlue / LastLevel * Level)
-                self.levelWhite = int(self.levelWhite / LastLevel * Level)
-                if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
-                    self._updateDevice(Unit, nValue=1, sValue=str(Level), Color=Color, TimedOut=0)
-                else:
-                    self._updateDevice(Unit, TimedOut=1)
+                self.tasksQueue.put({"Action": "SetLevel", "Color": Color, "Level": Level})
+
             else:
                 Domoticz.Error("Device {} has sent an unknown command: {}".format(Devices[Unit].Name, Command))
 
         elif Unit == 2:  # Effects selector switch
-            self.effect = 255 if Level == 0 else int(float(Level) / 10) -1
-            if self.lamp.set_effect(self.effect):
-                self._updateDevice(Unit,
-                                   nValue=0 if self.effect == 255 else 1,
-                                   sValue="" if self.effect == 255 else str((self.effect + 1) * 10),
-                                   TimedOut=0)
-            else:
-                self._updateDevice(Unit, TimedOut=1)
+            self.effect = 255 if Level == 0 else int(float(Level) / 10) - 1
+            self.tasksQueue.put({"Action": "SetEffect"})
 
         elif Unit == 3:  # Speed dimmer switch
             self.speed = max(int((100 - Level) / 100 * 255), 1)
-            if self.lamp.set_speed(self.speed):
-                self._updateDevice(Unit, nValue=0 if self.speed == 0 else 1, sValue=str(Level), TimedOut=0)
-            else:
-                self._updateDevice(Unit, TimedOut=1)
-
+            self.tasksQueue.put({"Action": "SetSpeed", "Level": Level})
 
     def onHeartbeat(self):
 
@@ -257,34 +227,131 @@ class BasePlugin:
             else:
                 self.nextpoll = now + timedelta(hours=int(Parameters["Mode1"]))
             Domoticz.Debug("next poll will be{}".format(self.nextpoll))
-            if self.lamp.get_state():
-                self.battery = int(self.lamp.battery)
-                self._updateDevice(1, BatteryLevel=self.battery, Forced=True, TimedOut=0)
-                # we update the battery level device if the user wants to see it
-                if Parameters["Mode2"] == "1" and not self.battery == 255:
-                    if self.battery >= 75:
-                        icon = "mipowplaybulbfull"
-                    elif self.battery >= 50:
-                        icon = "mipowplaybulbok"
-                    elif self.battery >= 25:
-                        icon = "mipowplaybulblow"
-                    else:
-                        icon = "mipowplaybulbempty"
+            self.tasksQueue.put({"Action": "GetBattery"})
+
+    def handleTasks(self):
+        try:
+            Domoticz.Debug("Entering tasks handler")
+            while True:
+                task = self.tasksQueue.get(block=True)
+                if task is None:
+                    Domoticz.Debug("Exiting task handler")
                     try:
-                        self._updateDevice(4, nValue=0, sValue=str(self.battery), Image=Images[icon].ID, TimedOut=0)
-                    except Exception as error:
-                        Domoticz.Error("Failed to update battery level device due to: {}".format(error))
-            else:
-                self._updateDevice(1, TimedOut=1)
-                if 4 in Devices:
-                    self._updateDevice(4, TimedOut=1)
+                        self.lamp.disconnect()
+                    except AttributeError:
+                        pass
+                    self.tasksQueue.task_done()
+                    break
+
+                Domoticz.Debug("handling task: '" + task["Action"] + "'.")
+
+                if task["Action"] == "Init":
+                    if self.lamp:
+                        self.lamp.timeout = 5  # we set 5 seconds for first discovery of the bluetooth device
+                        self.lamp.connect()
+                        self.lamp.strict_check = True if Parameters["Mode3"] == "1" else False
+                        if self.lamp.connected:
+                            self.lamp.timeout = 2  # connect went well so we can afford a shorter timeout (to be tested)
+                            self._ResetLamp()
+                    else:
+                        Domoticz.Error("Unable to create bluetooth lamp object ! Plugin will not be functional")
+                elif task["Action"] == "On":
+                    if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
+                        self._updateDevice(1, nValue=1, TimedOut=0)
+                        # resend effect and speed as these are lost when lamp is switched off
+                        time.sleep(1)
+                        self.lamp.set_effect(self.effect)
+                        self.lamp.set_speed(self.speed)
+                    else:
+                        self._updateDevice(1, TimedOut=1)
+
+                elif task["Action"] == "Off":
+                    if self.lamp.off():
+                        self._updateDevice(1, nValue=0, TimedOut=0)
+                    else:
+                        self._updateDevice(1, TimedOut=1)
+
+                elif task["Action"] == "SetColor":
+                    ColorDict = json.loads(task["Color"])
+                    Level = int(task["Level"])
+                    Domoticz.Debug(
+                        "Color dictionnary = {}, LastLevel = {}".format(Devices[1].Color, Devices[1].LastLevel))
+                    if ColorDict["m"] == 1 or ColorDict["m"] == 3:
+                        self.levelRed = int(ColorDict["r"] * Level / 100)
+                        self.levelGreen = int(ColorDict["g"] * Level / 100)
+                        self.levelBlue = int(ColorDict["b"] * Level / 100)
+                        self.levelWhite = int(ColorDict["ww"] * Level / 100)
+                        if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
+                            self._updateDevice(1, nValue=1, sValue=str(Level), Color=task["Color"], TimedOut=0)
+                        else:
+                            self._updateDevice(1, TimedOut=1)
+                    else:
+                        Domoticz.Error("Invalid 'Set Color' m-value: {}".format(ColorDict["m"]))
+
+                elif task["Action"] == "SetLevel":
+                    Level = int(task["Level"])
+                    LastLevel = 100 if Devices[1].LastLevel == 0 else Devices[1].LastLevel
+                    self.levelRed = int(self.levelRed / LastLevel * Level)
+                    self.levelGreen = int(self.levelGreen / LastLevel * Level)
+                    self.levelBlue = int(self.levelBlue / LastLevel * Level)
+                    self.levelWhite = int(self.levelWhite / LastLevel * Level)
+                    if self.lamp.set_rgbw(self.levelRed, self.levelGreen, self.levelBlue, self.levelWhite):
+                        self._updateDevice(1, nValue=1, sValue=str(Level), Color=task["Color"], TimedOut=0)
+                    else:
+                        self._updateDevice(1, TimedOut=1)
+
+                elif task["Action"] == "SetEffect":
+                    if self.lamp.set_effect(self.effect):
+                        self._updateDevice(2,
+                                           nValue=0 if self.effect == 255 else 1,
+                                           sValue="" if self.effect == 255 else str((self.effect + 1) * 10),
+                                           TimedOut=0)
+                    else:
+                        self._updateDevice(2, TimedOut=1)
+
+                elif task["Action"] == "SetSpeed":
+                    Level = int(task["Level"])
+                    if self.lamp.set_speed(self.speed):
+                        self._updateDevice(3, nValue=0 if self.speed == 0 else 1, sValue=str(Level), TimedOut=0)
+                    else:
+                        self._updateDevice(3, TimedOut=1)
+
+                elif task["Action"] == "GetBattery":
+                    if self.lamp.get_state():
+                        self.battery = int(self.lamp.battery)
+                        self._updateDevice(1, BatteryLevel=self.battery, Forced=True, TimedOut=0)
+                        # we update the battery level device if the user wants to see it
+                        if Parameters["Mode2"] == "1" and not self.battery == 255:
+                            if self.battery >= 75:
+                                icon = "mipowplaybulbfull"
+                            elif self.battery >= 50:
+                                icon = "mipowplaybulbok"
+                            elif self.battery >= 25:
+                                icon = "mipowplaybulblow"
+                            else:
+                                icon = "mipowplaybulbempty"
+                            try:
+                                self._updateDevice(4, nValue=0, sValue=str(self.battery), Image=Images[icon].ID,
+                                                   TimedOut=0)
+                            except Exception as error:
+                                Domoticz.Error("Failed to update battery level device due to: {}".format(error))
+                    else:
+                        self._updateDevice(1, TimedOut=1)
+                        if 4 in Devices:
+                            self._updateDevice(4, TimedOut=1)
+
+                else:
+                    Domoticz.Error("task handler: unknown action code '{}'".format(task["Action"]))
+
+                self.tasksQueue.task_done()
+                Domoticz.Debug("finished handling task: '" + task["Action"] + "'.")
+
+        except Exception as err:
+            Domoticz.Error("handletask: " + str(err))
 
     @staticmethod
     def _updateDevice(Unit, **kwargs):
         if Unit in Devices:
-            #if Parameters["Mode6"] != "0":
-            #    DumpDeviceAttribs(Unit)
-
             # check if kwargs contain an update for nValue or sValue... if not, use the existing one(s)
             if "nValue" in kwargs:
                 nValue = kwargs["nValue"]
@@ -331,7 +398,6 @@ class BasePlugin:
             if change:
                 Devices[Unit].Update(**update_args)
 
-
     def _ResetLamp(self):
         # switch what needs to be switched
 
@@ -373,29 +439,3 @@ def onCommand(Unit, Command, Level, Color):
 def onHeartbeat():
     global _plugin
     _plugin.onHeartbeat()
-
-
-# Generic helper functions
-
-def DumpDeviceAttribs(Unit):
-    Domoticz.Debug("Device {}.nValue = {}".format(Unit, Devices[Unit].nValue))
-    Domoticz.Debug("Device {}.sValue = {}".format(Unit, Devices[Unit].sValue))
-    Domoticz.Debug("Device {}.LastLevel = {}".format(Unit, Devices[Unit].LastLevel))
-    Domoticz.Debug("Device {}.Color = {}".format(Unit, Devices[Unit].Color))
-    Domoticz.Debug("Device {}.TimedOut = {}".format(Unit, Devices[Unit].TimedOut))
-    Domoticz.Debug("Device {}.BatteryLevel = {}".format(Unit, Devices[Unit].BatteryLevel))
-
-
-def DumpConfigToLog():
-    for x in Parameters:
-        if Parameters[x] != "":
-            Domoticz.Debug("'" + x + "':'" + str(Parameters[x]) + "'")
-    Domoticz.Debug("Device count: " + str(len(Devices)))
-    for x in Devices:
-        Domoticz.Debug("Device:           " + str(x) + " - " + str(Devices[x]))
-        Domoticz.Debug("Device ID:       '" + str(Devices[x].ID) + "'")
-        Domoticz.Debug("Device Name:     '" + Devices[x].Name + "'")
-        Domoticz.Debug("Device nValue:    " + str(Devices[x].nValue))
-        Domoticz.Debug("Device sValue:   '" + Devices[x].sValue + "'")
-        Domoticz.Debug("Device LastLevel: " + str(Devices[x].LastLevel))
-    return
